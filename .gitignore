@@ -1,0 +1,12 @@
+.idea/
+__pycache__/
+logs/
+results/*/
+.ipynb_checkpoints/
+*.obj
+sync.sh
+treeHPYP.egg-info/
+.Rproj.user/
+*.Rproj
+*.out
+*.slurm
