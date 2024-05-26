@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "phylojumps"
+version = "0.1.0"
+description = "aaa"
+packages = [
+    {include = "treeHPYPcts"}
+]
+authors = ["Steven Nguyen <steven.n.1618@gmail.com>", "Hanxi Sun <hanxi.sun.work@gmail.com>", "Vinayak Rao <varao@purdue.edu>", "Heejung Shim <heejung.shim@unimelb.edu.au>"]
+maintainers = ["Steven Nguyen <steven.n.1618@gmail.com>"]
+license = "GPL"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python="^3.8"
+numpy="^1.23"
+ete3="^3.1.2"
+pandas="^1.4.4"
+tqdm="^4.64.1"
+scipy="^1.9.1"
+seaborn="^0.11.2"
+PyQt5="^5.15.7"
+pyarrow="^16.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
