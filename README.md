@@ -15,7 +15,7 @@ this hierarchy reflecting the connection between species within the tree.
 Using `pip`, install PhyloJumps to your current environment by running
 
 ```sh
-pip install git+https://github.com/shimlab/PhyloJumps.gitc
+pip install git+https://github.com/shimlab/PhyloJumps.git
 ```
 
 This is equivalent to cloning the environment and building the package.
@@ -45,9 +45,3 @@ See `examples`.
 ### Documentation
 
 TODO
-
-
-
-
-
->>>>>>> b38d3eb (initial commit getting ready for publication)
