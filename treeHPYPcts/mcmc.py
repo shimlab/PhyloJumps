@@ -273,7 +273,7 @@ class TreeMCMC:
             else:
                 self.base_dist = norminvgamma(**metadata['base_dist']['params'])
         except KeyError as e:
-            print(f"Could not find parameter {e} in metadata")
+            raise Warning(f"Could not find parameter {e} in metadata")
 
 
     def load_proposal(self, proposal_pkl:str):
@@ -498,7 +498,7 @@ class TreeMCMC:
 
 
     #@check_data
-    def sample_bayes_factors(self, jumps: List[int], num_it:int, burnin:int, seed:int = None):
+    def conditional_sample(self, jumps: List[int], num_it:int, burnin:int, seed:int = None):
         if seed is not None:
             np.random.seed(seed)
 
@@ -536,20 +536,20 @@ class TreeMCMC:
         return counts
 
     #@check_data
-    def bayes_factors_multiple(self, jumps:List[int], num_chains:int = 1, num_it:int = 1000, burnin:int = None, parallel: bool = False, n_cores:int = None):
+    def compare_jps_by_mcmc(self, jumps:List[int], num_chains:int = 1, num_it:int = 1000, burnin:int = None, parallel: bool = False, n_cores:int = None):
         if burnin is None:
             burnin = num_it // 2
         if n_cores is None:
             n_cores = os.cpu_count()
         if not parallel:
             return np.array([
-                self.sample_bayes_factors(jumps, num_it, burnin) for _ in range(num_chains)
+                self.conditional_sample(jumps, num_it, burnin) for _ in range(num_chains)
             ])
         else:
             with ProcessPoolExecutor(max_workers=n_cores) as executor:
                 futures = []
                 for i in range(num_chains):
-                    futures.append(executor.submit(self.sample_bayes_factors,
+                    futures.append(executor.submit(self.conditional_sample,
                                                    jumps, num_it, burnin, seed = i))
 
                 samples = [f.result() for f in futures]
