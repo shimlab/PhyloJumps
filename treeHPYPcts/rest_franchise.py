@@ -817,15 +817,44 @@ class RestFranchise:
 
         return invgamma.rvs(a = post_alpha, scale = post_beta, size = 1).item(),post_alpha, post_beta
 
-    def particleMCMC (self, data: pd.DataFrame,
-                       proposal: Proposal,
-                       num_particles: int = 5,
-                       seed: int = None, n_iter: int = 2000, return_particles: bool = False, return_rests: bool = False,
-                       fix_jump_rate: bool = False, prior_mean_njumps: float = 1., init_jp: list [ int ] = None,
-                       init_jr: float = None, init_log_lik: float = None,
-                       conc: float = None, disc: float = None,
-                       var_prior: str = None, var_prior_params: list [ float ] = None, plot_dir='',
-                       progress_bar=True):
+
+    def run_particle_filtering(self,data,num_particles,var_prior,var_prior_params):
+
+        if var_prior not in ["wishart", "fixed", "gamma", None]:
+            raise ValueError("a prior for kernel variance should be specified and one of wishart, fixed (constant) or gamma")
+        if var_prior is None:
+            var_prior = self._var_prior
+        if var_prior_params is None:
+            var_prior_params = self._prior_params
+
+        if var_prior is None:
+            raise ValueError("a prior for kernel variance should be specified and one of wishart, fixed (constant) or gamma")
+
+        if var_prior == "gamma" or var_prior == "fixed":
+            mean = var_prior_params[0]
+            sd = var_prior_params[1]
+            base = norm(mean, sd)
+
+            if var_prior == "gamma":
+                alpha = var_prior_params[2]
+                beta = var_prior_params[3]
+                kernel_var = invgamma.rvs(a = alpha, scale = 1 / beta, size = 1).item()
+            else:
+                kernel_var = var_prior_params[2]
+
+
+        elif var_prior == "wishart":
+            base = norminvgamma(var_prior_params[0], var_prior_params[1],
+                                var_prior_params[2], var_prior_params[3])
+            kernel_var = None
+        ps = Particles(tree=self, num_particles=num_particles, forward=True,
+                       var_prior=var_prior, kernel_var=kernel_var, base=base)
+        return ps.particle_filter_integrated(data)  # out_log=out_log, log=log
+
+    def particleMCMC(self, data, proposal: Proposal, approximate: bool = False,num_particles=5, seed = None, n_iter=2000, return_particles=False, return_rests=False,
+                    fix_jump_rate=False, prior_mean_njumps=1., init_jp = None, init_jr=None, init_log_lik=None,
+                     var_prior = None, var_prior_params = None, cores = 1, plot_dir = '',
+                     progress_bar=True):  # detailed_info=False, todo
         """
         Generate posterior samples of (jump_rate, jps) with Particle MCMC algorithm,
         where jps denotes jumps on branches.
@@ -884,23 +913,6 @@ class RestFranchise:
             var_prior = self._var_prior
         if var_prior_params is None:
             var_prior_params = self._prior_params
-        params_to_set = {}
-        if conc is None:
-            if self.conc is None:
-                raise ValueError("Concentration parameter must be specified")
-            else:
-                params_to_set['conc'] = self.conc
-        else:
-            params_to_set['conc'] = conc
-        if disc is None:
-            if self.disc is None:
-                raise ValueError("Discount parameter must be specified")
-            else:
-                params_to_set['disc'] = self.disc
-        else:
-            params_to_set['disc'] = disc
-
-        self.set_parameters(params_to_set['disc'], params_to_set['conc'], depend = True)
 
         if var_prior is None:
             raise ValueError("a prior for kernel variance should be specified and one of wishart, fixed (constant) or gamma")
@@ -924,6 +936,10 @@ class RestFranchise:
                                 var_prior_params[2], var_prior_params[3])
             kernel_var = None
 
+
+
+
+
         # initialize jump rate and jps
         if init_jp is not None:
             self.jps = init_jp
@@ -943,11 +959,30 @@ class RestFranchise:
         self._logger.info("Generating posterior samples...")
         p = log_lik = log_acc = None
 
+        # prepare multicore processor if enabled
+        executor = None
+        if (cores is not None):
+            self._logger.info("Using %d cores for particle filtering", cores)
+            if cores == -1:
+                executor = concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count())
+            elif (cores > 1):
+                executor = concurrent.futures.ProcessPoolExecutor(max_workers=cores)
+            elif cores == 1:
+                pass
+            else:
+                raise ValueError("Invalid number of CPU cores.")
+
+
         for it in tqdm(range(n_iter), disable=(not progress_bar)):
             # new jump rate (if not fixed)
             self._logger.debug("Iteration %d ---------------------------------------------------------------------", it)
             self._logger.debug("Current number of jumps: %d", sum(self.jps))
             self._logger.debug("Performing Gibbs updates.")
+            if approximate and it > 0:
+                self._logger.debug("Recomputing loglikleihood for current state.")
+                ps = Particles(tree=self, num_particles=num_particles, forward=True,
+                               var_prior = var_prior, kernel_var = kernel_var, base = base)
+                log_lik_recomputed = ps.particle_filter_integrated(data, executor=executor) 
             jr, jr_post_alpha, jr_post_beta = self.sample_post_jump_rate(prior_mean_njumps) if not fix_jump_rate else (jr,None,None)
             post_jrs[it] = jr
             self._logger.debug("New jump rate: %.5f", jr)
@@ -957,7 +992,7 @@ class RestFranchise:
                 self._logger.debug("New kernel variance: %.5f", kernel_var)
 
             ids, log_ratio, if_same = proposal.propose_jps(self, jr)
-
+            #log["sampled"][it] = ids
 
             # Acceptance
             if if_same:  # if proposed jps is the same with the previous sample
@@ -974,12 +1009,13 @@ class RestFranchise:
             else:  # particle filter estimation of data log-likelihood
                 ps = Particles(tree=self, num_particles=num_particles, forward=True,
                                var_prior = var_prior, kernel_var = kernel_var, base = base)
-                log_lik = ps.particle_filter_integrated(data)  # out_log=out_log, log=log
-
-
+                log_lik = ps.particle_filter_integrated(data, executor=executor)
                 p = ps.get_particle() if (return_particles or return_rests) else None
 
-                log_acc = log_lik - log_lik_pre + log_ratio
+                if approximate and it > 0:
+                    log_acc = log_lik - log_lik_recomputed + log_ratio
+                else:
+                    log_acc = log_lik - log_lik_pre + log_ratio
                 log_acc_prob = np.log(np.random.rand(1))[0]
                 accepted = (log_acc > log_acc_prob)
                 self._logger.debug("Jump / proposal log ratio: %.5f", log_ratio)
@@ -1011,11 +1047,19 @@ class RestFranchise:
             if return_particles:
                 post_particles[it] = p_pre
 
+            #if make_plots: self.plot_with_jp(file=os.path.join(plot_dir, f"{it}_accepted.png"))
         if make_plots:
             for i, proposed in enumerate(log['proposed']):
                 accepted = post_jps.getrow(i).toarray().flatten().tolist()
-                self.plot_with_jp(jp=list(accepted), file=os.path.join(plot_dir, f"{i}_accepted.png"))
-                self.plot_with_jp(jp=proposed, file=os.path.join(plot_dir, f"{i}_proposed.png"))
+
+
+                if executor:
+
+                    executor.submit(self.plot_with_jp, jp=list(accepted), file=os.path.join(plot_dir, f"{i}_accepted.png"))
+                    executor.submit(self.plot_with_jp, jp=proposed, file=os.path.join(plot_dir, f"{i}_proposed.png"))
+                else:
+                    self.plot_with_jp(jp=list(accepted), file=os.path.join(plot_dir, f"{i}_accepted.png"))
+                    self.plot_with_jp(jp=proposed, file=os.path.join(plot_dir, f"{i}_proposed.png"))
         # clean and process info
         log["acc_rate"] /= n_iter
         log['same_proposal_rate'] = np.mean(log['same_proposal'])
@@ -1026,6 +1070,9 @@ class RestFranchise:
 
         if progress_bar:
             print("DONE!")
+
+        if executor is not None:
+            executor.shutdown()
 
         if var_prior != "gamma":
             return {"log": log,
@@ -1489,6 +1536,606 @@ class RestFranchise:
                                  title=title,
                                  file=file,
                                  dpi=dpi)
+
+    # ########################################################################################################
+    #
+    # def simulation(self, each_size=1, K=2, p0=None):  # simulate data with K categories
+    #     new = self.deep_copy()
+    #
+    #     data = pd.DataFrame(columns=['node_name', 'obs'])
+    #
+    #     if p0 is None:
+    #         p0 = Categorical.uniform(K=K)
+    #
+    #     for n in new.leaves.values():
+    #         sl = p0.sample(each_size)
+    #         if each_size == 1:
+    #             sl = [sl]
+    #         for s in sl:
+    #             data = data.append({'node_name': n.name, 'obs': s}, ignore_index=True)
+    #
+    #     return data
+    #
+    # def find_jump_and_simulate(self, K=None, labels=None, node_name=None, nleaf=None, delta_p=.0, each_size=1,
+    #                            base: Categorical = None, test_subtree=None):
+    #     new = self.deep_copy()
+    #
+    #     data = pd.DataFrame(columns=['node_name', 'obs'])
+    #
+    #     if base is None:
+    #         if K is not None:
+    #             labels = [i for i in range(K)]
+    #         elif labels is None:
+    #             K, labels = 2, [0, 1]
+    #         p0 = Categorical.uniform(labels=labels)
+    #     else:
+    #         labels = list(base.keys())
+    #         p0 = base
+    #     # p1 = Categorical.uniform(labels=labels)
+    #     p1 = Categorical(duplicate_from=p0)
+    #     sign = float(np.sign(1 - (p1[labels[0]] + 2 * delta_p)))
+    #     p1[labels[0]] += sign * 2. * delta_p
+    #     for k in labels[1:]:
+    #         p1[k] -= sign * 2. * delta_p / (len(labels) - 1)
+    #
+    #     if node_name is not None:
+    #         node = new.nodes[node_name]
+    #     elif nleaf is not None:
+    #         if nleaf == 0:
+    #             node = new.root
+    #         else:
+    #             node = new.set_jps_by_nleaf(nleaf=nleaf, not_in_subtree=test_subtree)
+    #     else:
+    #         node = new.root
+    #
+    #     tree_observed_name = new.observed.keys()
+    #     node_observed_name = node.get_observed().keys()
+    #     for k in tree_observed_name:
+    #         if k in node_observed_name:
+    #             sl = p1.sample(each_size)
+    #         else:
+    #             sl = p0.sample(each_size)
+    #         if each_size == 1:
+    #             sl = [sl]
+    #         for s in sl:
+    #             data = data.append({'node_name': k, 'obs': s}, ignore_index=True)
+    #
+    #     return data, node.name, new.jps
+    #
+    # def generator_preprocess(self, disc=None, conc=None, depend=None, jps=None,
+    #                          base=None, sizes=None, init_rests=True,
+    #                          out_log=False, log_file=None):
+    #     """
+    #     Pre-process self (new in generator()) and clean parameter for generator
+    #     :return: log file and sample size at each node
+    #     """
+    #     log = get_log(log_file, out_log, "generator_log.txt")
+    #
+    #     new = self.deep_copy()
+    #
+    #     if disc is not None:
+    #         new.disc = disc
+    #     if conc is not None:
+    #         new.conc = conc
+    #     if depend is not None:
+    #         new.depend = depend
+    #     if jps is not None:
+    #         new.jps = jps
+    #
+    #     # sample size at each node
+    #     node_sizes = {}
+    #     node_names = new.observed.keys()
+    #     if sizes is None:
+    #         if (not type(each_size) == int) or each_size <= 0:
+    #             raise ValueError("each_size should be a positive int. ")
+    #         else:
+    #             for k in node_names:
+    #                 node_sizes[k] = each_size
+    #     elif type(sizes) == dict:
+    #         for n in sizes:
+    #             if (not type(sizes[n]) == int) or sizes[n] < 0:
+    #                 raise ValueError("Elements of sizes should be non-negative int. ")
+    #             if sizes[n] > 0:
+    #                 node_sizes[n] = sizes[n]
+    #         if sum(node_sizes.values()) == 0:
+    #             raise ValueError("There should be at least 1 positive element in sizes. ")
+    #     elif type(sizes) == list:
+    #         if not len(sizes) == len(node_names):
+    #             raise ValueError("Length of sizes should agree with the number of leaves in the tree. ")
+    #         else:
+    #             for k, num in zip(node_names, sizes):
+    #                 if (not type(num) == int) or num < 0:
+    #                     raise ValueError("Elements of sizes should be non-negative int. ")
+    #                 elif num > 0:
+    #                     node_sizes[k] = num
+    #             if sum(node_sizes.values()) == 0:
+    #                 raise ValueError("There should be at least 1 positive element in sizes. ")
+    #     else:
+    #         raise TypeError("Type of sizes should be dict or list. ")
+    #
+    #     # the base measure
+    #     if base is not None:
+    #         if base == "uniform":
+    #             # category labels
+    #             if labels is None:
+    #                 if num_cat is None:
+    #                     raise ValueError("num_cat should not be None when the labels need to be specified.")
+    #                 labels = [n for n in range(num_cat)]
+    #             labels = list(labels)
+    #
+    #             new.uniform_base(labels)
+    #         else:
+    #             if type(base) != Categorical:
+    #                 raise TypeError("base should be a valid base measure of type Categorical. ")
+    #             for k in base.keys():
+    #                 if k not in labels:
+    #                     raise ValueError("Invalid base measure: base label {0} not in labels {1}".format(k, labels))
+    #         new.base = base
+    #     else:
+    #         labels = list(new.base.keys())
+    #
+    #     # prepare restaurants
+    #     if init_rests:
+    #         new.init_rests()
+    #
+    #     if out_log:
+    #         jump_tree, ref_names = new.jps_prune()
+    #
+    #         log.write("\n" + ("=" * 80 + "\n") * 3 + "\n" +
+    #                   "Full Tree: \n" + new.str_print(tree=True, jps=True, observed=True) + "\n")
+    #         log.write("\nPruned tree: " + jump_tree.str_print(tree=True, rests=True) + "\n")
+    #
+    #     return log, node_sizes, labels, new
+    #
+    # def generator(self, disc=None, conc=None, depend=None, jps=None,
+    #               base=None, sizes=None, init_rests=True,
+    #               out_log=False, log_file=None):
+    #     """
+    #     # todo complete the note
+    #     # todo remove all "labels" arguments.
+    #     Generate synthetic data given jps
+    #     :param disc: discount parameter of Pitman-Yor process
+    #     :param conc: ---
+    #     :param depend: ---
+    #     :param jps: jps, if None then uses the jps specified with the tree
+    #     :param base: default: "uniform" ---
+    #     :param labels: a list of labels of all available types, if None then use 0, 1, ..., num_cat-1
+    #     :param num_cat: number of categories, only active when names is None
+    #     :param sizes: a list or dict of number of samples on each node, if None then use each_size
+    #     :param each_size: an int to specify number of samples on each node, only active when sizes is None.
+    #     :param init_rests: if restaurants will be initialized
+    #                        (whether seated customers in the current tree will be removed).
+    #     :param out_log: if True ---
+    #     :param log_file: ---
+    #     :return: generated data (pandas.DataFrame) with node_name and obs
+    #     """
+    #     log, node_sizes, labels, tree = self.generator_preprocess(disc, conc, depend, jps, base,
+    #                                                               sizes, init_rests, out_log, log_file)
+    #
+    #     # simulate data
+    #     data = {}
+    #     for node_name in node_sizes.keys():
+    #         data[node_name] = dict.fromkeys(labels, 0)
+    #
+    #         for idx in range(node_sizes[node_name]):
+    #             obs = tree.seat_new_obs(node_name)
+    #             data[node_name][obs] += 1
+    #             if out_log:
+    #                 log.write("\n" + node_name + ": sample {0} = {1}".format(idx+1, obs) +
+    #                           "\n" + tree.str_print(rests=True) + "\n")
+    #
+    #     # adjust data format
+    #     data = pd.DataFrame(data)
+    #     if out_log:
+    #         log.write("\n" + "="*80 + "\n\nSynthetic data:\n" + data.__str__())
+    #
+    #     data = pd.melt(data)
+    #     data = pd.concat([data, pd.Series(labels * len(node_sizes))], axis=1)
+    #     data.rename(columns={'variable': 'node_name', 'value': 'ct', 0: 'obs'}, inplace=True)
+    #     data = data.reindex(data.index.repeat(data.ct))
+    #     data.index = [i for i in range(data.shape[0])]
+    #     data = data[['node_name', 'obs']]
+    #
+    #     return data, tree
+
+
+########################################################################################################################
+
+    # def train_test_split(self, data, test_size=0.2, node_names=None,
+    #                      by_subtree=False, subtree_root_name=None, balance=False):
+    #     """
+    #     :param data:
+    #     :param test_size: todo 0<= <=1
+    #     :param node_names:
+    #     :param by_subtree:
+    #     :param subtree_root_name:
+    #     :param balance: equal amount samples on each node
+    #     :return:
+    #     """
+    #     n = None
+    #     if (node_names is None) and (not by_subtree):
+    #         node_names = self.observed.keys()
+    #     elif by_subtree:
+    #         done = False
+    #         for n in self.root.traverse():
+    #             if n.name == subtree_root_name:
+    #                 done = True
+    #                 break
+    #         if not done:
+    #             raise ValueError("Unable to find the (jump) node with name " + subtree_root_name + ".")
+    #         node_names = n.get_observed().keys()
+    #
+    #     def sample(obj):
+    #         return obj.sample(frac=test_size)
+    #
+    #     if balance:
+    #         test = data[data.node_name.isin(node_names)].groupby('node_name').apply(sample)
+    #         train = data.drop(test.index.levels[1])
+    #     else:
+    #         test = sample(data[data.node_name.isin(node_names)])
+    #         train = data.drop(test.index)
+    #
+    #     test.reset_index(drop=True, inplace=True)
+    #     train.reset_index(drop=True, inplace=True)
+    #
+    #     return train, test
+
+    ####################
+    # data likelihoods #
+    ####################
+
+    # def data_jps_loglik(self, data, model="HPY", particle_filter=None, num_particles=5, forward=True,
+    #                     jps=None, var=None, base=None, labels=None):
+    #     """
+    #     log-likelihood of the data, given the number of jumps on each branch (jps)
+    #     :param data:
+    #     :param model:
+    #     :param particle_filter:
+    #     :param num_particles:
+    #     :param forward:
+    #     :param jps: todo infer from the tree directly?
+    #     :param var: todo change name to parameter
+    #     :param base:  todo infer from the tree directly?
+    #     :param labels:
+    #     :return:
+    #     """
+    #     other = self.deep_copy()
+    #     other.parameters_by_model(model, var)
+    #     loglik = None
+    #     if base == 'uniform':
+    #         other.uniform_base(labels)
+    #     if jps is not None:
+    #         other.jps = jps
+    #     if particle_filter is None:
+    #         particle_filter = True if model == "HPY" else False
+    #
+    #     # Calculate the log-likelihood for the hierarchical PY model with discount = param
+    #     if model == "HPY":
+    #         if not particle_filter:
+    #             raise ValueError("Cannot calculate the log likelihood without using particle filter for HPY model.")
+    #         ps = Particles(tree=other, num_particles=num_particles, forward=True)
+    #         loglik = ps.particle_filter(data)  # out_log=out_log, log=log
+    #
+    #     # Calculate the log-likelihood for the hierarchical Dirichlet model with concentration = param
+    #     elif model == "HDP":
+    #         if particle_filter:
+    #             ps = Particles(tree=other, num_particles=num_particles, forward=True)
+    #             loglik = ps.particle_filter(data)  # out_log=out_log, log=log
+    #         else:
+    #             jump_tree, ref_names = other.jps_prune()
+    #             counts = pd.crosstab(data.obs, data.node_name.map(ref_names)).to_dict()
+    #
+    #             loglik = 0
+    #             for c in counts.values():
+    #                 n = np.array([c[k] if k in c.keys() else 0 for k in other.base.keys()])
+    #                 alpha = np.array([other.conc * v for v in other.base.values()])
+    #
+    #                 loglik += (gammaln(np.sum(n)+1) - np.sum(gammaln(n+1)) +
+    #                            gammaln(np.sum(alpha)) - np.sum(gammaln(alpha)) +
+    #                            np.sum(gammaln(n+alpha)) - gammaln(np.sum(n+alpha)))
+    #     # del other
+    #     return loglik
+
+    # def subtree_data_loglik(self, data, model="HPY", jump_rate=1, node_name=None,
+    #                         particle_filter=None, num_particles=5, forward=None):
+    #     other = self.deep_copy()
+    #
+    #     node = self.get_node_by_name(node_name)
+    #     node.poisson_jps(jump_rate=jump_rate)  # sample jumps in the subtree
+    #     node_base = node.rest.base
+    #     node.init_rests(other.disc, other.conc, node_base)
+    #     other.update_jps()
+    #
+    #     return other.data_jps_loglik(data, model=model, particle_filter=particle_filter,
+    #                                  num_particles=num_particles, forward=forward)
+    #
+    # def data_loglik(self, data, model="HPY", jump_rate=1, node_name=None, num_sample=100, particle_filter=None,
+    #                 num_particles=5, forward=True, var=None):
+    #     # self, data = tree, test
+    #     other = self.deep_copy()
+    #     other.parameters_by_model(model, var)
+    #
+    #     logliks = np.zeros(num_sample)
+    #     for i in range(num_sample):
+    #         if node_name is None:
+    #             other.poisson_jps(jump_rate=jump_rate)
+    #             logliks[i] = other.data_jps_loglik(data=data, model=model, particle_filter=particle_filter,
+    #                                                num_particles=num_particles, forward=forward)
+    #         else:
+    #             # really need to sample jumps within the subtree? or better,
+    #             # restricted the posterior sampling within the part of tree that have data
+    #             logliks[i] = other.subtree_data_loglik(data=data, model=model, jump_rate=jump_rate,
+    #                                                    node_name=node_name, particle_filter=particle_filter,
+    #                                                    num_particles=num_particles, forward=forward)
+    #     return np.mean(logliks)
+    #
+    # def test_post_loglik(self, test, train, model="HPY", node_name=None, num_particles=3, var=None,
+    #                      num_sample=700, burn_out=300, progress_bar=False):
+    #     if progress_bar:
+    #         print("Calculating posterior test likelihood ...")
+    #
+    #     other = self.deep_copy()
+    #     other.parameters_by_model(model, var)
+    #
+    #     n_iter = burn_out + num_sample
+    #     info, post_jump_rate, post_jps, post_particles = other.particleMCMC(train, return_particles=True,
+    #                                                                         num_particles=num_particles,
+    #                                                                         n_iter=n_iter, progress_bar=progress_bar)
+    #
+    #     if progress_bar:
+    #         print("Estimating likelihood...")
+    #     pct10 = num_sample // 10
+    #
+    #     logliks = np.zeros(num_sample)
+    #     for i in range(num_sample):
+    #         tree = post_particles[burn_out+i]
+    #         jump_rate = post_jump_rate[burn_out+i]
+    #
+    #         if node_name is None:
+    #             logliks[i] = tree.data_jps_loglik(test, model=model)
+    #         else:
+    #             logliks[i] = tree.data_loglik(test, model=model, jump_rate=jump_rate,
+    #                                           node_name=node_name, num_sample=10)
+    #         if progress_bar and (i+1) % pct10 == 0:
+    #             print("..{}0%".format((i+1)//pct10))
+    #
+    #     return np.mean(logliks), post_jump_rate, post_jps, post_particles
+    #
+    #
+    # def particleMCMC_branches(self, data, branches,
+    #                           num_particles=5, n_iter=2000, return_particles=False, return_rests=False,
+    #                           fixed_jump_rate=False, init_jr=None, init_log_lik=-np.Inf,  # div_name=None,
+    #                           prior_mean_njumps=1., total_number_of_jumps=1,
+    #                           out_log=False, log_file=None, progress_bar=False):  # detailed_info=False, todo
+    #     """
+    #     Generate posterior samples of (jump_rate, jps) with Particle MCMC algorithm,
+    #     where jps denotes jumps on branches.
+    #     :param data: the pandas.DataFrame data
+    #     :param branches: branches to be considered
+    #     :param num_particles: number of particles for the particle filtering step
+    #     :param n_iter: number of MCMC iterations
+    #     :param return_particles: whether posterior samples of the particles will
+    #                              also be returned
+    #     :param return_rests: whether rests of particles will be returned
+    #     :param div_name: the type of divergence to use
+    #     :param fixed_jump_rate: whether the jump rate is fixed to "init_jr"
+    #     :param init_jr: initial jump rate, will be a sample from the prior if None
+    #     :param init_log_lik: initial log likelihood (in order to connect with previous
+    #                          runs of samples.
+    #     :param prior_mean_njumps: prior mean number of jumps
+    #     :param total_number_of_jumps: total number of jumps allowed
+    #     :param branches: a list of branches considered while updating
+    #     :param out_log: if True, will output log information for each iteration
+    #     :param log_file: the log file name (string)
+    #     :param progress_bar: whether a progress bar will be printed
+    #
+    #     :return: info, posterior samples of jump_rate, jps, and particles (None
+    #              when not return_particles)
+    #     """
+    #     # pct10 = n_iter // 10
+    #
+    #     log = get_log(log_file, out_log, "particleMCMC.txt")
+    #
+    #     if out_log:
+    #         log.write("")
+    #
+    #     # initialize the information output
+    #     info = {"acc_rate": 0,
+    #             'accepted': [False] * n_iter,
+    #             'log_lik': [0.] * n_iter,
+    #             'log_acc': [0.] * n_iter,
+    #             'proposed': [[0] * (self.nb + 1)] * n_iter,
+    #             'sampled': [[0, 0]] * n_iter}
+    #
+    #     # containers of posterior samples
+    #     post_jump_rate = np.zeros(n_iter)
+    #     post_jps = np.zeros((n_iter, self.nb + 1), dtype=int)  # nb+1: (i,0) = 1 (# of jumps on base-root branch)
+    #     post_particles = [None] * n_iter
+    #     # post_divs = np.zeros((n_iter, self.nb))
+    #     post_partitions = np.empty((n_iter, self.nb+1), dtype=int)  # the partition
+    #
+    #     names = []
+    #     if return_rests:
+    #         for lbl in self.base.keys():
+    #             names += ["{}_nt".format(lbl), "{}_nc".format(lbl)]
+    #     post_rests = pd.DataFrame(columns=['iter', 'node_name'] + names)
+    #
+    #     if init_jr is None:
+    #         if fixed_jump_rate:
+    #             raise ValueError("No jump rate (init_jr) set. ")
+    #         jr = self.sample_prior_jump_rate(prior_mean_njumps)
+    #         log_lik_pre = -np.Inf
+    #     else:
+    #         jr = init_jr
+    #         self.poisson_jps(jr)
+    #         log_lik_pre = init_log_lik
+    #
+    #     self.jps = {}
+    #     id_nodes = self.id_nodes
+    #     id_nodes[np.random.choice(branches)].njump = total_number_of_jumps
+    #     self.update_jps()
+    #     # print("init: {}".format(np.where(self.jps)[0]))
+    #
+    #     # fake records for previous iteration (iteration -1)
+    #     # when idx=0, the fake pre will assure acceptance
+    #     jps_pre, p_pre, p = self.jps, None, None
+    #     # affected_leaves, log_ratio = set(self.leaves.values()), 0
+    #     log_ratio = log_lik = log_acc = 0.
+    #     if_same = False
+    #
+    #     # Start the iteration
+    #     if progress_bar:
+    #         print("Generating posterior samples...", now())
+    #
+    #     for it in tqdm(range(n_iter), disable=(not progress_bar)):
+    #         if if_same:
+    #             accepted = True
+    #         else:
+    #             ps = Particles(tree=self.jps_prune(), num_particles=num_particles, forward=True)
+    #             log_lik = ps.particle_filter(data)  # out_log=out_log, log=log
+    #             p = ps.get_particle() if (return_particles or return_rests or div_name) else None
+    #             log_acc = log_lik - log_lik_pre + log_ratio
+    #             accepted = (log_acc > np.log(np.random.rand(1)[0]))
+    #
+    #         info['accepted'][it] = accepted
+    #         info['log_lik'][it] = log_lik
+    #         info['log_acc'][it] = log_acc
+    #         info['proposed'][it] = self.jps
+    #
+    #         # update the samples
+    #         post_jump_rate[it] = jr
+    #
+    #         if accepted:  # accept the proposed jps
+    #             # print(" -- acc")
+    #             post_jps[it, :] = self.jps
+    #             jps_pre = self.jps
+    #             log_lik_pre = log_lik
+    #             p_pre = p.deep_copy()
+    #             if return_particles:
+    #                 post_particles[it] = p.deep_copy()
+    #             if return_rests:
+    #                 p_rests = p.rests()
+    #                 p_rests['iter'] = it
+    #                 post_rests = pd.concat([post_rests, p_rests])
+    #             if div_name is not None:
+    #                 post_divs[it] = p.divs(div_name)
+    #
+    #             info["acc_rate"] += 1
+    #         else:  # reject the proposed jps
+    #             # if out_log:
+    #             #     log.write("REJECT!\n")
+    #             post_jps[it, :] = jps_pre
+    #             self.jps = jps_pre
+    #             if return_particles:
+    #                 post_particles[it] = p_pre.deep_copy()
+    #             if return_rests:
+    #                 if p_pre is None:
+    #                     p_rests = pd.DataFrame(columns=['iter', 'node_name'] + names)
+    #                     p_rests.loc[0] = np.nan
+    #                 else:
+    #                     p_rests = p_pre.rests()
+    #                 p_rests['iter'] = it
+    #                 post_rests = pd.concat([post_rests, p_rests])
+    #             # if div_name is not None:
+    #             #     if p_pre is None:
+    #             #         post_divs[it] = np.nan
+    #             #     else:
+    #             #         post_divs[it] = p_pre.divs(div_name)
+    #         # record partition
+    #         post_partitions[it] = self.partition_by_jps()[0]
+    #
+    #         # generate new proposal
+    #         jr = self.sample_post_jump_rate(prior_mean_njumps) if not fixed_jump_rate else init_jr
+    #         ids, log_ratio, if_same = self.switch_jumps_branches(jr, branches, id_nodes)
+    #         # print(ids)
+    #         info["sampled"][it] = ids
+    #
+    #         # print("iter-{}: {}; \t {}".format(it, np.where(self.jps)[0], ids))
+    #
+    #     # clean and process info
+    #     info["acc_rate"] /= n_iter
+    #
+    #     info["last_jr"] = jr  # last jump_rate
+    #     info["last_jps"] = self.jps  # last jps
+    #     info["last_ll"] = log_lik_pre  # last log_lik
+    #
+    #     self.jps = {'Root': 1}  # reset the jps
+    #
+    #     # print("DONE!", now(), "count_same = {} / {} = {}. ".format(count_same, n_iter, count_same/n_iter))
+    #     print("DONE!", now())
+    #
+    #     return {"info": info,
+    #             "jump_rate": post_jump_rate,
+    #             "jumps": post_jps,
+    #             "partitions": post_partitions,
+    #             # "divs": post_divs,
+    #             "particles": post_particles,
+    #             "restaurants": post_rests}
+
+    # def parameters_by_model(self, model="HPY", var=None):
+    #     # the hierarchical PY model with discount = var
+    #     if model == "HPY":
+    #         if var is None and self.conc > 0:
+    #             var = 1 - 1 / (self.conc + 1)
+    #         else:
+    #             var = self.disc
+    #         self.set_parameters(var, 0, True)
+    #
+    #     # the hierarchical Dirichlet model with concentration = var
+    #     elif model == "HDP":
+    #         if var is None and self.disc > 0:
+    #             var = 1 / (1 - self.disc) - 1  # keep the same variance
+    #         else:
+    #             var = self.conc
+    #         self.set_parameters(0, var, False)
+    #
+    #     # when type is not acceptable
+    #     else:
+    #         raise ValueError("model can either be \"HPY\" for hierarchical Pitman-Yor processes" +
+    #                          " or \"HDP\" for hierarchical Dirichlet processes, (not {}).".format(model))
+    #
+    # def rests(self, rn=None):
+    #     """
+    #     A pandas.DataFrame object of nodes & rests
+    #     :return:
+    #     """
+    #     if rn is None:
+    #         _, rn = self.jps_prune(init_rests=False)
+    #     labels = list(self.base.keys())
+    #     names = []
+    #     for i in labels:
+    #         names += ["{}_nt".format(i), "{}_nc".format(i)]
+    #     rests = pd.DataFrame(columns=["node_name"] + names)
+    #     idx = 0
+    #     for n in self.root.traverse(strategy='preorder'):
+    #         if n.njump > 0:
+    #             rests.loc[idx] = [n.name] + [0] * (2 * len(labels))
+    #             for i in labels:
+    #                 tbl = n.rest[i]
+    #                 rests["{}_nt".format(i)][idx] = tbl.nt
+    #                 rests["{}_nc".format(i)][idx] = tbl.nc
+    #             idx += 1
+    #     ref_names = {}
+    #     for n in self.root.traverse(strategy='preorder'):
+    #         if n.njump == 0 and (not n.is_root()):
+    #             ref_names[n.up.name] = n.name
+    #             if n.is_observed():
+    #                 ref_names[n.name] = n.name
+    #         else:
+    #             ref_names[n.name] = n.name
+    #             if not n.is_root():
+    #                 ref_names[n.up.name] = n.up.name
+    #     for k, v in ref_names.items():
+    #         if k != v:
+    #             idx = [k]
+    #             while v != ref_names[v]:
+    #                 idx.append(v)
+    #                 v = ref_names[v]
+    #             while ref_names[k] != v:
+    #                 ref_names[k] = v
+    #     rests.node_name = rests.node_name.map(ref_names)
+    #     rests.node_name = rests.node_name.map(rn)
+    #     return rests
 
 
 

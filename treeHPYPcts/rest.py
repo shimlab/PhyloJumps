@@ -382,3 +382,53 @@ class Rest(dict):
             post[k] = float(np.sum(pi[atoms == k]))
         # print(post)
         return post
+
+
+########################################################################################################################
+
+# # from rest import Rest
+# from categorical import Categorical
+# # parent {0: (2, 36), 1: (1, 1)} base {0: 0.5, 1: 0.5}
+# rp = Rest(disc=.5, base=Categorical.uniform(2))
+# rp.add_customer(0)
+# rp.add_customer(1)
+# rp.add_customer(0, True)
+# for _ in range(36-2):
+#     rp.add_customer(0, False)
+#
+# rp.post_measure()
+#
+
+# child {1: (1, 9), 0: (2, 3)} base {0: 1.0, 1: 0.0}
+
+########################################################################
+# digamma function
+
+# from scipy.special import digamma
+# ds = 1-1e-8
+# s = 0.
+# i = 0
+# while np.exp(s) > .05:
+#     i += 1
+#     v = i * (digamma(i * ds) - digamma(1 + (i - 1) * ds))
+#     # if i < 10:
+#     print("{:5d}: ".format(i), v)
+#     s += v
+# print(i, v)
+# n_atom = (1 + i // 50) * 50
+# n_atom = int(2.5*1e5)
+# r = Rest(disc=ds, base=Categorical.uniform(2))
+# pk = r.p_key()
+# atoms = np.array(pk.sample(n=n_atom))
+# pi1 = np.random.beta(1 - r.disc, r.nc + (np.arange(n_atom)+1) * r.disc)
+# pi = np.zeros(n_atom)
+# s = 0
+# for i in range(n_atom):
+#     pi[i] = pi1[i] * (1 - s)
+#     s += pi[i]
+# print(sum(pi))
+# pi /= np.sum(pi)
+# post = Categorical()
+# for k in pk.keys():
+#     post[k] = float(np.sum(pi[atoms == k]))
+# print(post)

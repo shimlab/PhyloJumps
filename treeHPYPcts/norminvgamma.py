@@ -12,8 +12,8 @@ from scipy.special import gamma
 from scipy.stats import expon
 import numpy as np
 
-class norminvgamma():
 
+class norminvgamma(rv_continuous):
     def __init__(self, mu0, nu, alpha, beta):
         self.mu0 = mu0
         self.nu = nu
@@ -21,7 +21,7 @@ class norminvgamma():
         self.beta = beta
 
     def argcheck(self, mu0, nu, alpha, beta):
-        return (self.alpha > 0)
+        return self.alpha > 0
 
     def rvs(self, size=1):
         sigma_2 = gengamma.rvs(self.alpha, self.beta, size=size)
@@ -33,9 +33,6 @@ class norminvgamma():
     def pdf(self, mu, var):
         t1 = ((self.nu) ** 0.5) * ((self.beta) ** self.alpha)
         t2 = (var * (2 * 3.15) ** 0.5) * gamma(self.alpha)
-        t3 = (1 / var ** 2) ** (self.alpha + 1)
-        t4 = expon.pdf((2 * self.beta + self.nu * (self.mu0 - mu) ** 2) / (2 * var ** 2))
-        # print (t1, t2, t3, t4)
+        t3 = (1 / var**2) ** (self.alpha + 1)
+        t4 = expon.pdf((2 * self.beta + self.nu * (self.mu0 - mu) ** 2) / (2 * var**2))
         return (t1 / t2) * t3 * t4
-
-

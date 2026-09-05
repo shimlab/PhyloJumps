@@ -4,11 +4,13 @@ serialisation of MCMC logs.
 
 @author: Steven Nguyen
 """
+import matplotlib.pyplot as plt
 
 from . import RestFranchise, Particles, evals
 from .jump_proposal import *
 from .norminvgamma import norminvgamma
 from scipy.stats import invgamma, poisson, norm
+from scipy.special import logsumexp
 import scipy as sp
 from typing import Union
 import numpy as np
@@ -21,6 +23,7 @@ import json
 import zipfile
 import tempfile
 from typing import List
+from ete3 import Tree
 
 def zip_directory(directory_path, zip_file_path):
     # Create a ZipFile object in write mode
@@ -65,7 +68,7 @@ class TreeMCMC:
 
     def __init__(
         self,
-        tree : RestFranchise = None,
+        tree : Union[Tree, RestFranchise] = None, 
         data : pd.DataFrame = None,
         num_samples : int = 5000,
         burnin : int = None,
@@ -77,14 +80,24 @@ class TreeMCMC:
         conc: float = 0,
         var_prior: str = 'gamma',
         var_prior_params: List[float] = None,
+        burnin_steps: int = None,
+        num_chains: int = 1,
         proposal_method: Proposal = None,
         progress_bar: bool = False,
     ):
-        self.tree = tree
+        if isinstance(tree, Tree):
+            self._restfranchise = RestFranchise(newick=tree, disc = disc, conc = conc) 
+        elif isinstance(tree, RestFranchise):
+            self._restfranchise = tree
+            self._restfranchise.disc = disc
+            self._restfranchise.conc = conc 
         self.data = data
         self.num_samples = num_samples
-        self.burnin = burnin if burnin is not None else num_samples // 2
+        self.burnin_steps = burnin_steps if burnin_steps is not None else num_samples // 2
+        self.num_chains = num_chains
         self.progress_bar = progress_bar
+        self.disc = disc
+        self.conc = conc
         if proposal_method is None:
             proposal_method = MultiProposal(strategy='cycle')
             proposal_method.add_proposals(
@@ -96,13 +109,10 @@ class TreeMCMC:
         self.fix_jump_rate = fix_jump_rate
         self.var_prior = var_prior
         self.prior_mean_njumps = prior_mean_njumps
-        self.conc = conc
-        self.disc = disc
         if var_prior_params is None:
             self.var_prior_params = self._default_var_prior_params()
         else:
             assert self._validate_prior(var_prior, var_prior_params, prior_mean_njumps)
-            self.var_prior_params  =var_prior_params
         # check base distribution
         if base_dist is None:
             if self.var_prior == 'wishart':
@@ -236,14 +246,16 @@ class TreeMCMC:
 
     def load_log(self, path):
         logs = pd.read_parquet(os.path.join(path, 'log.parquet'))
-
-        logs = logs.to_dict('records')
-
+        n_logs = logs.shape[0]
+        proposal_matrices = [0] * n_logs
         for f in os.listdir(os.path.join(path, 'proposed')):
             idx = int(f.split('.')[0])
             proposed = sp.sparse.load_npz(os.path.join(path, 'proposed', f))
-            logs[idx]['proposed'] = proposed.tolil()
+            proposal_matrices[idx] = proposed
 
+        # format to a standard format
+        logs = logs.to_dict()
+        logs['proposed'] = proposal_matrices
         return logs
 
 
@@ -374,29 +386,30 @@ class TreeMCMC:
     def run_with(self, tree: RestFranchise, data: pd.DataFrame, trait_column:str = 'obs',
                  parallel: bool = False, max_workers:int = os.cpu_count()
                  ):
-        self.tree = tree
+        self._restfranchise = tree
         df = data[['node_name', trait_column]].rename(columns = {trait_column : 'obs'})
         self.data = df
         self.run(parallel, max_workers)
 
-    #@check_data
-    def run(self, num_chains: int, parallel: bool = False, max_workers: int = os.cpu_count()):
+
+    def run(self, parallel = False, max_workers = 6):
+
+
         var_prior = self.var_prior
-        self.num_chains = num_chains
         var_prior_params = self.var_prior_params
         if (var_prior == 'fixed') or (var_prior == 'gamma'):
             var_prior_params = [self.base_dist.mean(), self.base_dist.std()] + var_prior_params
 
         seed = np.random.get_state()[1][0]
-        self._seeds = [seed + i for i in range(num_chains)]
+        self._seeds = [seed + i for i in range(self.num_chains)]
 
         if not parallel:
-            self._logs = [self.tree.particleMCMC(
+            self._logs = [self._restfranchise.particleMCMC(
                 data = self.data, proposal = self.proposal_method, num_particles = self.num_particles,
                 n_iter = self.num_samples, prior_mean_njumps=self.prior_mean_njumps, var_prior=var_prior,
                 conc = self.conc, disc = self.disc,
                 var_prior_params = var_prior_params, progress_bar = self.progress_bar, seed = i + seed
-            ) for i in range(num_chains)]
+            ) for i in range(self.num_chains)]
 
         else:
             self._multi_chain_parallel(max_workers, data = self.data, proposal = self.proposal_method, num_particles = self.num_particles,
@@ -440,7 +453,7 @@ class TreeMCMC:
 
 
     def _multi_chain_parallel(self, max_workers: int, **kwargs):
-        trees = [self.tree.deep_copy() for _ in range(self.num_chains)]
+        trees = [self._restfranchise.deep_copy() for _ in range(self.num_chains)]
         futures = []
         with ProcessPoolExecutor(max_workers = max_workers) as executor:
             for i in range(self.num_chains):
@@ -463,21 +476,21 @@ class TreeMCMC:
             post_var = self.var_prior_params[0]
         else:
             post_var = 1.
-        tree = self.tree.deep_copy()
+        tree = self._restfranchise.deep_copy()
         tree.jps = jp
         datall = np.zeros(it)
-        postvar = np.zeros(it)
         for i in range(it):
             if gamma_prior:
-                post_var, post_alpha, post_beta = tree.sample_post_var(self.data, alpha, beta)
-                postvar[i] = invgamma.logpdf(x=post_var, a=post_alpha, scale=post_beta)
+                _, post_alpha, post_beta = tree.sample_post_var(self.data, alpha, beta)
+                post_var = post_beta / (post_alpha + 1)
             ps = Particles(tree=tree, num_particles=self.num_particles, forward=True,
                            var_prior=self.var_prior, kernel_var=post_var, base=self.base_dist)
             datall[i] = ps.particle_filter_integrated(self.data)
 
-        return datall, postvar
+        return datall
 
-    #@check_data
+
+
     def compare_jps_by_ll(self, *args, parallel:bool = True, max_workers:int = 6, **kwargs):
         """
         sample the data loglikelihoods for jumps specified in *args
@@ -496,17 +509,24 @@ class TreeMCMC:
         # for now just return the loglikelihoods
         return lls
 
-
-    #@check_data
-    def conditional_sample(self, jumps: List[int], num_it:int, burnin:int, seed:int = None):
+    def sample_bayes_factors(self, jumps, num_it, burnin, seed = None):
         if seed is not None:
             np.random.seed(seed)
 
-        tree = self.tree.deep_copy()
+        tree = self._restfranchise.deep_copy()
         prev_jp = None
         prev_loglik = -np.inf
         n = len(jumps)
         counts = [0 for _ in range(n)]
+        trace = {
+            'samples': [],
+            'proposed' : [],
+            'accepted': [],
+            'log_lik' : [],
+            'log_lik_proposed' : [],
+            'log_lik_prev' : [],
+            'log_acc' : [],
+        }
         prior =  self.var_prior
 
         if prior == 'gamma':
@@ -517,39 +537,52 @@ class TreeMCMC:
             post_var = 1. # doesn't matter
 
         for j in range(num_it):
-            tree.jps = jumps[j % n]
+            tree_n = np.random.choice(n)
+            
+            trace['proposed'].append(tree_n)
+            trace['log_lik_prev'].append(prev_loglik)
+            
+            tree.jps = jumps[tree_n]
             if prior == 'gamma':
-                post_var, post_alpha, post_beta = self.tree.sample_post_var(self.data, alpha, beta)
+                post_var, post_alpha, post_beta = self._restfranchise.sample_post_var(self.data, alpha, beta)
             ps = Particles(tree=tree, num_particles=self.num_particles, forward=True,
                            var_prior=self.var_prior, kernel_var=post_var, base=self.base_dist)
             log_lik = ps.particle_filter_integrated(self.data)
+            
+            trace['log_lik_proposed'].append(log_lik)
+            
             log_acc_prob = np.log(np.random.rand(1))[0]
             if log_lik - prev_loglik > log_acc_prob:
-                prev_jp = j % n
+                trace['accepted'].append(1)
+                prev_jp = tree_n 
                 prev_loglik = log_lik
                 if j >= burnin:
-                    counts[j % n] += 1
+                    counts[tree_n] += 1
             else:
+                trace['accepted'].append(0)
                 if j >= burnin:
                     counts[prev_jp] += 1
+            trace['log_lik'].append(prev_loglik)
+            trace['samples'].append(prev_jp)
 
-        return counts
+        return counts, trace
 
-    #@check_data
-    def compare_jps_by_mcmc(self, jumps:List[int], num_chains:int = 1, num_it:int = 1000, burnin:int = None, parallel: bool = False, n_cores:int = None):
+
+
+    def bayes_factors_multiple(self, jumps, num_chains:int = 1, num_it:int = 1000, burnin:int = None, parallel: bool = False, n_cores:int = None):
         if burnin is None:
             burnin = num_it // 2
         if n_cores is None:
             n_cores = os.cpu_count()
         if not parallel:
             return np.array([
-                self.conditional_sample(jumps, num_it, burnin) for _ in range(num_chains)
+                self.sample_bayes_factors(jumps, num_it, burnin) for _ in range(num_chains)
             ])
         else:
             with ProcessPoolExecutor(max_workers=n_cores) as executor:
                 futures = []
                 for i in range(num_chains):
-                    futures.append(executor.submit(self.conditional_sample,
+                    futures.append(executor.submit(self.sample_bayes_factors,
                                                    jumps, num_it, burnin, seed = i))
 
                 samples = [f.result() for f in futures]
@@ -582,6 +615,12 @@ class TreeMCMC:
         acc_rates = np.array([
             np.cumsum(log['accepted']) / (1 + np.arange(len(log['accepted']))) for log in self._logs
         ])
+        if acc_rates.shape[0] == 1:
+            fig,ax = plt.subplots()
+            ax.plot(acc_rates[0])
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel("Acceptance Rate")
+            return fig, ax
         fig, axes = self._grid_trace_plot(acc_rates, figsize)
         fig.suptitle('Acceptance Rates')
         return fig, axes
@@ -594,6 +633,12 @@ class TreeMCMC:
         traces = np.array([
             sample[parameter] for sample in self._samples
         ])
+        if traces.shape[0] == 1:
+            fig, ax = plt.subplots()
+            ax.plot(traces[0])
+            ax.set_xlabel("Iteration")
+            ax.set_ylabel(parameter)
+            return fig, ax
         fig, axes = self._grid_trace_plot(traces, figsize)
         fig.suptitle(parameter)
         return fig, axes
@@ -621,20 +666,28 @@ class TreeMCMC:
 
 
 
-    def bayes_factor_nojumps(self, chain: Union[int, dict], burn_in: int = None):
+    def bayes_factor_nojumps(self, chain: Union[int, dict] = None, burn_in: int = None):
         """
         compute the bayes factor for the hypothesis 'no jump' against 'at least one jump'
         """
-        if isinstance(chain, int):
-            chain = self._samples[chain]
+        if len(self._samples) > 1:
+            if chain is not None:
+                chain = self._samples[chain]
+            else:
+                pass
+        else:
+            if chain is not None:
+                raise ValueError("only one chain in mcmc object")
+            chain = self._samples[0]
+
         jps = chain['jumps']
         if burn_in is None:
             burn_in = jps.shape[0] // 2
         njps = np.sum(jps[burn_in:], axis=1) - 1
         post0 = np.mean(njps == 0)
 
-        prior_expected_njps = self.prior_params['jump_rate'] * self.tree.tl
-        if self.prior_params['fix_jump_rate']: # prior is poisson
+        prior_expected_njps = self.prior_mean_njumps
+        if self.fix_jump_rate: # prior is poisson
             prior0 = poisson.pmf(0, prior_expected_njps)
         else: # prior is poisson | exponential
             prior0 = 1. / (prior_expected_njps + 1)
@@ -643,12 +696,12 @@ class TreeMCMC:
         return (1. - post0) / post0 / ((1. - prior0) / prior0) if post0 > 0 else np.Inf
 
 
-    def summarise_results(self, result_dir: str, burnin: int = None, ground_truth: List[int] = None, chain: Union[int, dict] = None):
+    def summarise_results(self, result_dir: str, burnin: int = None, chain: Union[int, dict] = None):
         """
         summarise chains by computing a summary table and returning the predicted jump configuration for each chain
         """
         if burnin is None:
-            burnin = self.num_samples // 2
+            burnin = self.burnin_steps
 
         if not os.path.exists(result_dir):
             os.makedirs(result_dir)
@@ -658,9 +711,9 @@ class TreeMCMC:
                 jps = chain['jumps']
                 partitions = chain['partitions']
                 summary = evals.summarise_jump_trace(jps[burnin:], partitions[burnin:],
-                                                     list(self.tree.nodes.keys()), ground_truth=ground_truth)
+                                                     list(self._restfranchise.nodes.keys()))
                 summary.to_csv(os.path.join(result_dir, f"{self._seeds[i]}_summary.csv"), index = False)
-                self.tree.plot_with_jp(jp=summary['predicted_jp'].tolist(),
+                self._restfranchise.plot_with_jp(jp=summary['predicted_jp'].tolist(),
                                   file=os.path.join(result_dir, f"{self._seeds[i]}_tree.png"),
                                   dpi=200
                                   )
@@ -671,9 +724,9 @@ class TreeMCMC:
                 jps = chain['jumps']
                 partitions = chain['partitions']
                 summary = evals.summarise_jump_trace(jps[burnin:], partitions[burnin:],
-                                                     list(self.tree.nodes.keys()), ground_truth=ground_truth)
+                                                     list(self._restfranchise.nodes.keys()))
                 summary.to_csv(os.path.join(result_dir, f"{self._seeds[i]}_summary.csv"), index=False)
-                self.tree.plot_with_jp(jp=summary['predicted_jp'].tolist(),
+                self._restfranchise.plot_with_jp(jp=summary['predicted_jp'].tolist(),
                                        file=os.path.join(result_dir, f"{self._seeds[i]}_tree.png"),
                                        dpi=200
                                        )
@@ -682,9 +735,9 @@ class TreeMCMC:
             jps = chain['jumps']
             partitions = chain['partitions']
             summary = evals.summarise_jump_trace(jps[burnin:], partitions[burnin:],
-                                                 list(self.tree.nodes.keys()))
+                                                 list(self._restfranchise.nodes.keys()))
             summary.to_csv(os.path.join(result_dir, f"_summary.csv"), index=False)
-            self.tree.plot_with_jp(jp=summary['predicted_jp'].tolist(),
+            self._restfranchise.plot_with_jp(jp=summary['predicted_jp'].tolist(),
                                    file=os.path.join(result_dir, f"tree.png"),
                                    dpi=200
                                    )
