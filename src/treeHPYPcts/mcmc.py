@@ -5,6 +5,7 @@ serialisation of MCMC logs.
 @author: Steven Nguyen
 """
 import matplotlib.pyplot as plt
+from numpy.typing import ArrayLike
 
 from . import RestFranchise, Particles, evals
 from .jump_proposal import *
@@ -12,7 +13,6 @@ from .norminvgamma import norminvgamma
 from scipy.stats import invgamma, poisson, norm
 from scipy.special import logsumexp
 import scipy as sp
-from typing import Union
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor
 import pickle as pkl
@@ -22,7 +22,7 @@ import os
 import json
 import zipfile
 import tempfile
-from typing import List
+from typing import Iterable, Union, Optional, List
 from ete3 import Tree
 
 def zip_directory(directory_path, zip_file_path):
@@ -79,10 +79,10 @@ class TreeMCMC:
         disc: float = 0.5,
         conc: float = 0,
         var_prior: str = 'gamma',
-        var_prior_params: List[float] = None,
+        var_prior_params: Optional[List[float]] = None,
         burnin_steps: int = None,
         num_chains: int = 1,
-        proposal_method: Proposal = None,
+        proposal_method: Optional[Proposal] = None,
         progress_bar: bool = False,
     ):
         if isinstance(tree, Tree):
@@ -113,6 +113,7 @@ class TreeMCMC:
             self.var_prior_params = self._default_var_prior_params()
         else:
             assert self._validate_prior(var_prior, var_prior_params, prior_mean_njumps)
+            self.var_prior_params = var_prior_params
         # check base distribution
         if base_dist is None:
             if self.var_prior == 'wishart':
@@ -407,13 +408,12 @@ class TreeMCMC:
             self._logs = [self._restfranchise.particleMCMC(
                 data = self.data, proposal = self.proposal_method, num_particles = self.num_particles,
                 n_iter = self.num_samples, prior_mean_njumps=self.prior_mean_njumps, var_prior=var_prior,
-                conc = self.conc, disc = self.disc,
                 var_prior_params = var_prior_params, progress_bar = self.progress_bar, seed = i + seed
             ) for i in range(self.num_chains)]
 
         else:
             self._multi_chain_parallel(max_workers, data = self.data, proposal = self.proposal_method, num_particles = self.num_particles,
-                n_iter = self.num_samples, prior_mean_njumps=self.prior_mean_njumps, var_prior=var_prior, conc = self.conc, disc = self.disc,
+                n_iter = self.num_samples, prior_mean_njumps=self.prior_mean_njumps, var_prior=var_prior, 
                 var_prior_params = var_prior_params, progress_bar = False)
 
         # write samples
@@ -696,7 +696,7 @@ class TreeMCMC:
         return (1. - post0) / post0 / ((1. - prior0) / prior0) if post0 > 0 else np.Inf
 
 
-    def summarise_results(self, result_dir: str, burnin: int = None, chain: Union[int, dict] = None):
+    def summarise_results(self, result_dir: str, burnin: Optional[int] = None, chain: Optional[Union[int, dict]] = None, ground_truth: Optional[Iterable[int]] = None):
         """
         summarise chains by computing a summary table and returning the predicted jump configuration for each chain
         """
@@ -711,7 +711,7 @@ class TreeMCMC:
                 jps = chain['jumps']
                 partitions = chain['partitions']
                 summary = evals.summarise_jump_trace(jps[burnin:], partitions[burnin:],
-                                                     list(self._restfranchise.nodes.keys()))
+                                                     list(self._restfranchise.nodes.keys()), ground_truth=ground_truth)
                 summary.to_csv(os.path.join(result_dir, f"{self._seeds[i]}_summary.csv"), index = False)
                 self._restfranchise.plot_with_jp(jp=summary['predicted_jp'].tolist(),
                                   file=os.path.join(result_dir, f"{self._seeds[i]}_tree.png"),
@@ -724,7 +724,7 @@ class TreeMCMC:
                 jps = chain['jumps']
                 partitions = chain['partitions']
                 summary = evals.summarise_jump_trace(jps[burnin:], partitions[burnin:],
-                                                     list(self._restfranchise.nodes.keys()))
+                                                     list(self._restfranchise.nodes.keys()), ground_truth=ground_truth)
                 summary.to_csv(os.path.join(result_dir, f"{self._seeds[i]}_summary.csv"), index=False)
                 self._restfranchise.plot_with_jp(jp=summary['predicted_jp'].tolist(),
                                        file=os.path.join(result_dir, f"{self._seeds[i]}_tree.png"),

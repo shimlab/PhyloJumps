@@ -44,12 +44,13 @@ def main(
     tree.rescale()
     mcmc = TreeMCMC(
         tree, data, num_samples, num_particles,
+        num_chains = num_chains,
         var_prior = var_prior, var_prior_params = var_prior_params,
         proposal_method=proposal_method, prior_mean_njumps=prior_mean_njumps,
         base_dist=base_dist
     )
 
-    mcmc.run(num_chains = num_chains,
+    mcmc.run(
              parallel = True
              )
     mcmc.save_mcmc(os.path.join(result_dir, 'mcmc.zip'))
@@ -65,7 +66,7 @@ if __name__ == '__main__':
     # parameters for PMCMC algorithm
     disc = 0.5
     var_prior_params = [1.]
-    num_samples = 2000
+    num_samples = 100 
     num_particles = 5
     num_chains = 6
     var_prior = 'fixed'

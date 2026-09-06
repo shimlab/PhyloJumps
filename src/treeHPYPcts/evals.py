@@ -73,8 +73,10 @@ def summarise_jump_trace(samples, post_Zs, nodes, min_jump = 1, threshold = 0.5,
     if median: data_dic['predicted_jp'] = estimate_jps(samples, post_Zs, at_least_one_jump=True)
     if ground_truth is not None:
         data_dic['ground_trth'] = ground_truth
-        data_dic['correct_hits'] = (samples == ground_truth).sum(axis=0)
+        data_dic['correct_hits'] = np.asarray((samples == ground_truth).sum(axis=0)).ravel()
         data_dic['incorrect_hits'] = n_samples - data_dic['correct_hits']
+    
+    print(data_dic)
 
     return pd.DataFrame(data_dic)
 
